@@ -215,9 +215,10 @@ Summary:
 
    C++ modules may be used in user-provided C++ files.  Verilator compiles
    its generated code with modules disabled, so the precompiled header (PCH)
-   remains usable, and keeps the module flags for user files.  Verilator does
-   not build module interface units or module CMIs; imported modules must be
-   prebuilt before building the Verilated model.
+   remains usable, and keeps the module flags for user files.  Verilator
+   builds module interface units given as user files, and GCC header units
+   imported by user files.  Other imported modules must be prebuilt before
+   building the Verilated model.
 
    With GCC, pass :command:`-CFLAGS -fmodules` and prebuild the standard
    library module in the model object directory:
@@ -230,11 +231,14 @@ Summary:
    With Clang, precompile libc++'s ``std.cppm`` and pass
    :command:`-CFLAGS -fmodule-file=std=std.pcm`.  Clang's
    :command:`-fmodules` enables Clang modules, not C++20 modules.
-   The :command:`-fmodule-header` and :command:`-fmodule-only` options are not
-   supported.
+   Clang C++ header units are not supported.
 
-   For modules defined by the user, precompile the module interface unit and
-   pass the resulting object file to Verilator as a ``.o`` input.  Keep the
+   With GCC, header units imported by user files with
+   ``import "header.h";`` are built automatically, with their CMIs kept in
+   the model object directory.
+
+   For modules not built from user files, precompile the module interface unit
+   and pass the resulting object file to Verilator as a ``.o`` input.  Keep the
    module CMI in the model object directory, or pass it with
    :command:`-CFLAGS -fmodule-file` when using Clang.
 

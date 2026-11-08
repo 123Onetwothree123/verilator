@@ -739,10 +739,16 @@ public:
         of.puts("\n");
 
         VStringSet dirs;
+        bool moduleOnly = false;
+        for (const string& flag : v3Global.opt.cFlags()) {
+            if (flag == "-fmodule-only") moduleOnly = true;
+        }
+        const VStringSet& moduleFiles = v3Global.opt.moduleFiles();
         of.puts("# User .cpp files (from .cpp's on Verilator command line)\n");
         of.puts("VM_USER_CLASSES = \\\n");
         const VStringSet& cppFiles = v3Global.opt.cppFiles();
         for (const auto& cppfile : cppFiles) {
+            if (moduleOnly && moduleFiles.find(cppfile) != moduleFiles.end()) continue;
             of.puts("  " + V3Os::filenameNonDirExt(cppfile) + " \\\n");
             const string dir
                 = V3Os::filenameRelativePath(V3Os::filenameDir(cppfile), v3Global.opt.makeDir());
@@ -835,7 +841,8 @@ public:
             of.puts("\n");
         } else if (!v3Global.opt.libCreate().empty()) {
             const string libCreateDeps = "$(VK_OBJS) $(VK_USER_OBJS) $(VK_GLOBAL_OBJS) "
-                                         + v3Global.opt.libCreate() + ".o $(VM_HIER_LIBS)";
+                                         + v3Global.opt.libCreate() + ".o $(VM_HIER_LIBS)"
+                                         + " | $(VM_PREFIX)__ALL.a";
             of.puts("\n### Library rules from --lib-create\n");
             // The rule to create .a is defined in verilated.mk, so just define dependency here.
             of.puts(v3Global.opt.libCreateName(false) + ": " + libCreateDeps + "\n");
@@ -865,7 +872,8 @@ public:
             const string libname = "lib" + v3Global.opt.prefix() + ".a";
             of.puts("\n### Library rules (default lib mode)\n");
             // The rule to create .a is defined in verilated.mk, so just define dependency here.
-            of.puts(libname + ": $(VK_OBJS) $(VK_USER_OBJS) $(VM_HIER_LIBS)\n");
+            of.puts(libname + ": $(VK_OBJS) $(VK_USER_OBJS) $(VM_HIER_LIBS)"
+                    + " | $(VM_PREFIX)__ALL.a\n");
             of.puts("libverilated.a: $(VK_GLOBAL_OBJS)\n");
             // let default rule depend on '{prefix}__ALL.a', for compatibility
             of.puts("lib" + v3Global.opt.prefix() + ": " + libname
