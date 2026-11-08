@@ -769,7 +769,7 @@ public:
                 of.puts("  " + modulefile + " \\\n");
             of.puts("\n");
 
-            of.puts("VM_USER_BACKEND = gcc\n");
+            of.puts("VM_USER_BACKEND = $(VK_MODULE_BACKEND)\n");
             of.puts("\n");
             of.puts("$(VM_PREFIX)__modules.mk: $(VM_USER_SOURCES) $(VM_PREFIX).mk\n");
             of.puts("\t$(VK_MODULE_DEPS) --backend $(VM_USER_BACKEND) --cxx \"$(CXX)\" \\\n");

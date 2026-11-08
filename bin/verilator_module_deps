@@ -12,12 +12,15 @@
 import argparse
 import json
 import os
+import re
 import shlex
+import shutil
 import subprocess
 import sys
+from typing import Any, NoReturn
 
 
-def fatal(message: str) -> None:
+def fatal(message: str) -> NoReturn:
     sys.stderr.write("%Error: " + message + "\n")
     sys.exit(1)
 
@@ -48,19 +51,9 @@ def external_modules(flags: list[str]) -> set[str]:
     return modules
 
 
-def scan(args: argparse.Namespace) -> None:
-    cppflags = parse_flags(args.cppflags)
-    cxxflags = parse_flags(args.cxxflags)
-    external = external_modules(cppflags + cxxflags)
-
-    if args.backend != 'gcc':
-        fatal("Unsupported C++ module dependency backend '" + args.backend + "'")
-
-    if args.objdir:
-        os.makedirs(args.objdir, exist_ok=True)
-
-    modules = []
-    objects = {}
+def collect_sources(args: argparse.Namespace) -> list[dict[str, Any]]:
+    modules: list[dict[str, Any]] = []
+    objects: dict[str, str] = {}
     for source in args.source:
         abs_source = os.path.abspath(source)
         stem = os.path.splitext(os.path.basename(abs_source))[0]
@@ -69,49 +62,117 @@ def scan(args: argparse.Namespace) -> None:
             fatal("Multiple C++ sources produce '" + obj + "': '" + objects[obj] + "' and '"
                   + abs_source + "'")
         objects[obj] = abs_source
+        modules.append({
+            'source': abs_source,
+            'stem': stem,
+            'obj': obj,
+            'provides': [],
+            'requires': [],
+        })
+    return modules
 
-        deps_file = os.path.join(args.objdir, stem + '.deps.json')
+
+def scan_gcc(args: argparse.Namespace, cppflags: list[str], cxxflags: list[str],
+             modules: list[dict[str, Any]]) -> None:
+    for module in modules:
+        deps_file = os.path.join(args.objdir, module['stem'] + '.deps.json')
         command = ([args.cxx] + cppflags + cxxflags + [
             '-MM',
             '-fdeps-format=p1689r5',
             '-fdeps-file=' + deps_file,
-            '-fdeps-target=' + obj,
+            '-fdeps-target=' + module['obj'],
             '-fsyntax-only',
-            abs_source,
+            module['source'],
         ])
         result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         if result.returncode != 0:
             sys.stderr.write(result.stdout)
             sys.stderr.write(result.stderr)
-            fatal("C++ module scan failed for '" + abs_source + "'")
+            fatal("C++ module scan failed for '" + module['source'] + "'")
         if not os.path.exists(deps_file):
-            fatal("C++ module scan produced no dependency file for '" + abs_source + "'")
+            fatal("C++ module scan produced no dependency file for '" + module['source'] + "'")
 
         with open(deps_file, 'r', encoding='utf8') as fh:
             data = json.load(fh)
         rules = data.get('rules', [])
-        rule = next((entry for entry in rules if entry.get('primary-output') == obj), None)
+        rule = next((entry for entry in rules
+                     if entry.get('primary-output') == module['obj']), None)
         if rule is None and rules:
             rule = rules[0]
         if rule is None:
             rule = {}
 
-        provides = []
-        for provide in rule.get('provides', []):
-            if provide.get('is-interface', False):
-                provides.append(provide['logical-name'])
-        requires = []
-        for require in rule.get('requires', []):
-            requires.append(require['logical-name'])
+        module['provides'] = [provide['logical-name']
+                              for provide in rule.get('provides', [])
+                              if provide.get('is-interface', False)]
+        module['requires'] = [require['logical-name']
+                              for require in rule.get('requires', [])]
 
-        modules.append({
-            'source': abs_source,
-            'obj': obj,
-            'provides': provides,
-            'requires': requires,
+
+def find_clang_scan_deps(cxx: str) -> str:
+    scan_deps = shutil.which('clang-scan-deps')
+    if not scan_deps:
+        result = subprocess.run([cxx, '--version'], stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True)
+        match = re.search(r'clang version (\d+)', result.stdout)
+        if match:
+            scan_deps = shutil.which('clang-scan-deps-' + match.group(1))
+    if not scan_deps:
+        fatal("Could not find clang-scan-deps; install the Clang tools matching '" + cxx + "'")
+    return scan_deps
+
+
+def scan_clang(args: argparse.Namespace, cppflags: list[str], cxxflags: list[str],
+               modules: list[dict[str, Any]]) -> None:
+    scan_deps = find_clang_scan_deps(args.cxx)
+    objdir = os.path.abspath(args.objdir)
+
+    compile_commands: list[dict[str, str]] = []
+    for module in modules:
+        command = ([args.cxx] + cppflags + cxxflags
+                   + ['-c', module['source'], '-o', module['obj']])
+        compile_commands.append({
+            'directory': objdir,
+            'file': module['source'],
+            'output': module['obj'],
+            'command': ' '.join(shlex.quote(part) for part in command),
         })
+    database = os.path.join(objdir, 'compile_commands.json')
+    with open(database, 'w', encoding='utf8') as fh:
+        json.dump(compile_commands, fh, indent=2)
+        fh.write('\n')
 
-    providers = {}
+    deps_file = os.path.join(objdir, 'module_deps.json')
+    command = [scan_deps, '-format=p1689', '-compilation-database=' + database, '-o', deps_file]
+    result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if result.returncode != 0:
+        sys.stderr.write(result.stdout)
+        sys.stderr.write(result.stderr)
+        fatal("C++ module scan failed")
+    if not os.path.exists(deps_file):
+        fatal("C++ module scan produced no dependency file")
+
+    with open(deps_file, 'r', encoding='utf8') as fh:
+        data = json.load(fh)
+    rules: dict[str, dict[str, Any]] = {}
+    for rule in data.get('rules', []):
+        output = os.path.basename(rule.get('primary-output', ''))
+        rules[output] = rule
+
+    for module in modules:
+        rule = rules.get(module['obj'])
+        if rule is None:
+            fatal("C++ module scan produced no rule for '" + module['source'] + "'")
+        module['provides'] = [provide['logical-name']
+                              for provide in rule.get('provides', [])
+                              if provide.get('is-interface', False)]
+        module['requires'] = [require['logical-name']
+                              for require in rule.get('requires', [])]
+
+
+def resolve_modules(args: argparse.Namespace, modules: list[dict[str, Any]],
+                    external: set[str]) -> None:
+    providers: dict[str, dict[str, Any]] = {}
     for module in modules:
         for name in module['provides']:
             if name in providers:
@@ -120,25 +181,61 @@ def scan(args: argparse.Namespace) -> None:
             providers[name] = module
 
     for module in modules:
-        deps = set()
+        direct: list[dict[str, Any]] = []
         for name in module['requires']:
             if name in providers:
-                deps.add(providers[name]['obj'])
+                if providers[name] not in direct:
+                    direct.append(providers[name])
             elif name in external:
                 continue
             elif '/' in name:
                 continue
             elif name == 'std':
-                if not os.path.exists(os.path.join(args.objdir, 'gcm.cache', 'std.gcm')):
-                    fatal("C++ module 'std' is required, but gcm.cache/std.gcm was not found; "
-                          "precompile the std module before building")
+                if args.backend == 'gcc':
+                    if not os.path.exists(os.path.join(args.objdir, 'gcm.cache', 'std.gcm')):
+                        fatal("C++ module 'std' is required, but gcm.cache/std.gcm was not found; "
+                              "precompile the std module before building")
+                else:
+                    fatal("C++ module 'std' is required, but no -fmodule-file=std=<path>.pcm was "
+                          "provided; precompile the std module and pass "
+                          "-fmodule-file=std=<path>")
             else:
                 fatal("C++ module '" + name + "' required by '" + module['source']
                       + "' has no provider; precompile it and pass -fmodule-file=" + name
                       + "=<path>")
-        module['deps'] = sorted(deps)
+        module['direct_deps'] = direct
 
-    lines = []
+    for module in modules:
+        if args.backend == 'clang':
+            deps: list[dict[str, Any]] = []
+            seen: set[str] = set()
+            stack: list[dict[str, Any]] = list(module['direct_deps'])
+            while stack:
+                dep = stack.pop()
+                if dep['obj'] in seen:
+                    continue
+                seen.add(dep['obj'])
+                deps.append(dep)
+                stack.extend(dep['direct_deps'])
+            module['deps'] = sorted(deps, key=lambda entry: entry['obj'])
+        else:
+            module['deps'] = sorted({dep['obj'] for dep in module['direct_deps']})
+
+
+def clang_module_flags(module: dict[str, Any], include_self: bool) -> list[str]:
+    deps: list[dict[str, Any]] = list(module['deps'])
+    if include_self:
+        deps.append(module)
+    flags: list[str] = []
+    for dep in sorted(deps, key=lambda entry: entry['obj']):
+        pcm = dep['stem'] + '.pcm'
+        for name in sorted(dep['provides']):
+            flags.append('-fmodule-file=' + name + '=' + pcm)
+    return flags
+
+
+def generate_gcc(modules: list[dict[str, Any]]) -> str:
+    lines: list[str] = []
     module_objs = sorted({module['obj'] for module in modules if module['provides']})
     lines.append('VK_MODULE_OBJS = ' + ' '.join(module_objs))
     lines.append('')
@@ -151,7 +248,59 @@ def scan(args: argparse.Namespace) -> None:
         lines.append('\t$(OBJCACHE) $(CXX) $(OPT_FAST) $(CXXFLAGS) $(CPPFLAGS) -c '
                      + module['source'] + ' -o ' + module['obj'])
         lines.append('')
-    content = '\n'.join(lines)
+    return '\n'.join(lines)
+
+
+def generate_clang(modules: list[dict[str, Any]]) -> str:
+    lines: list[str] = []
+    module_objs = sorted(module['obj'] for module in modules)
+    lines.append('VK_MODULE_OBJS = ' + ' '.join(module_objs))
+    lines.append('')
+    lines.append('.PHONY: modules')
+    lines.append('modules: $(VK_MODULE_OBJS)')
+    lines.append('')
+    for module in sorted(modules, key=lambda entry: entry['obj']):
+        source = module['source']
+        obj = module['obj']
+        dep_pcms = sorted({dep['stem'] + '.pcm' for dep in module['deps']})
+        prereqs = [source, '$(VM_PREFIX).mk'] + dep_pcms
+        recipe = ['$(OBJCACHE)', '$(CXX)', '$(OPT_FAST)', '$(CXXFLAGS)', '$(CPPFLAGS)']
+        if module['provides']:
+            pcm = module['stem'] + '.pcm'
+            lines.append(pcm + ': ' + ' '.join(prereqs))
+            lines.append('\t' + ' '.join(recipe + clang_module_flags(module, False)
+                                          + ['--precompile', source, '-o', pcm]))
+            lines.append('')
+            prereqs = [pcm] + prereqs
+        lines.append(obj + ': ' + ' '.join(prereqs))
+        lines.append('\t' + ' '.join(recipe + clang_module_flags(module, bool(module['provides']))
+                                      + ['-c', source, '-o', obj]))
+        lines.append('')
+    return '\n'.join(lines)
+
+
+def scan(args: argparse.Namespace) -> None:
+    if args.backend not in ('gcc', 'clang'):
+        fatal("Unsupported C++ module dependency backend '" + args.backend + "'")
+
+    cppflags = parse_flags(args.cppflags)
+    cxxflags = parse_flags(args.cxxflags)
+    external = external_modules(cppflags + cxxflags)
+
+    if args.objdir:
+        os.makedirs(args.objdir, exist_ok=True)
+
+    modules = collect_sources(args)
+    if args.backend == 'gcc':
+        scan_gcc(args, cppflags, cxxflags, modules)
+    else:
+        scan_clang(args, cppflags, cxxflags, modules)
+    resolve_modules(args, modules, external)
+
+    if args.backend == 'gcc':
+        content = generate_gcc(modules)
+    else:
+        content = generate_clang(modules)
 
     old_content = None
     if os.path.exists(args.output):

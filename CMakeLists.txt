@@ -163,10 +163,12 @@ if(cxx_help MATCHES "include-pch")
     # clang
     set(CFG_CXXFLAGS_PCH_I -include-pch)
     set(CFG_GCH_IF_CLANG .gch)
+    set(CFG_CXX_MODULE_BACKEND clang)
 else()
     # GCC
     set(CFG_CXXFLAGS_PCH_I -include)
     set(CFG_GCH_IF_CLANG "")
+    set(CFG_CXX_MODULE_BACKEND gcc)
 endif()
 
 configure_file(include/verilated_config.h.in include/verilated_config.h @ONLY)

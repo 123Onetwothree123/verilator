@@ -994,7 +994,7 @@ void V3Options::notify() VL_MT_DISABLED {
                 break;
             }
         }
-        if (hasIxx || !cxxModuleFlags()) {
+        if (hasIxx) {
             cmdfl->v3error("Unsupported: C++ module interface files; precompile the interface "
                            "and pass the resulting object file");
         }
